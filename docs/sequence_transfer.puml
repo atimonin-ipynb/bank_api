@@ -1,0 +1,106 @@
+@startuml Transfer Sequence Diagram
+title Sequence Diagram: Перевод средств между счетами
+
+actor Клиент as client
+participant "API Gateway" as gateway
+participant "Auth Service" as auth
+participant "Accounts Service" as accounts
+participant "Kafka" as kafka
+participant "Notifications Service" as notify
+database "PostgreSQL" as db
+
+== Аутентификация ==
+client -> gateway: POST /auth/login\n{username, password}
+activate gateway
+gateway -> auth: Проверить учетные данные
+activate auth
+auth -> db: Запрос пользователя
+activate db
+db --> auth: Данные пользователя
+deactivate db
+auth --> gateway: JWT токен
+deactivate auth
+gateway --> client: 200 OK + JWT
+deactivate gateway
+
+== Перевод средств ==
+client -> gateway: POST /accounts/transfer\n{from, to, amount}\nAuthorization: Bearer <JWT>
+activate gateway
+
+group Валидация JWT
+  gateway -> auth: Проверить JWT
+  activate auth
+  alt Токен валиден
+    auth --> gateway: valid
+  else Токен невалиден
+    auth --> gateway: invalid/expired
+    deactivate auth
+    gateway --> client: 401 Unauthorized
+    ' deactivate gateway
+    ' return
+  end
+  deactivate auth
+end
+
+
+gateway -> accounts: Передать запрос
+activate accounts
+' activate gateway
+
+group Проверка счетов и баланса
+  accounts -> db: SELECT id, balance FROM accounts WHERE id IN (from_id, to_id)
+  activate db
+  db --> accounts: Данные счетов
+  deactivate db
+  
+  alt Какой-то счет не найден
+    accounts --> gateway: 404 Account not found
+    ' deactivate accounts
+    gateway --> client: 404 Account not found
+    ' deactivate gateway
+    ' return
+  else Баланс недостаточен
+    accounts --> gateway: 400 Insufficient funds
+    ' deactivate accounts
+    gateway --> client: 400 Insufficient funds
+    ' deactivate gateway
+    ' return
+  else Успешно
+    accounts -> db: BEGIN TRANSACTION
+    activate db
+    accounts -> db: UPDATE from_id SET balance = balance - amount
+    accounts -> db: UPDATE to_id SET balance = balance + amount
+    
+    alt Ошибка при обновлении
+      accounts -> db: ROLLBACK
+      accounts --> gateway: 500 Internal Error
+      ' deactivate db
+      ' deactivate accounts
+      gateway --> client: 500 Internal Error
+      ' deactivate gateway
+      ' return
+    else Успешно
+      accounts -> db: COMMIT
+      deactivate db
+      accounts --> gateway: 200 OK + {transaction_id, status: "completed"}
+      deactivate accounts
+      gateway --> client: 200 OK + {transaction_id, status: "completed"}
+      deactivate gateway
+      
+      par Асинхронные уведомления
+        accounts -> kafka: Отправить событие "transfer_completed"
+        activate kafka
+        kafka -> notify: Событие получено
+        activate notify
+        notify -> db: Сохранить уведомление
+        activate db
+        db --> notify: OK
+        deactivate db
+        deactivate notify
+        deactivate kafka
+      end
+    end
+  end
+end
+
+@enduml
